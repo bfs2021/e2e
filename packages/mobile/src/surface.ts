@@ -61,7 +61,16 @@ import {
   type ProjectedSnapshot,
 } from './nodes.ts';
 import { keyboardDragStart } from './keyboard.ts';
-import { DEVICE_PERMISSIONS, type AgentDeviceClient, type ClientFactory, type DevicePermission, type LaunchPermissions, type MobileOptions, type PermissionState } from './options.ts';
+import {
+  DEVICE_PERMISSIONS,
+  type AgentDeviceClient,
+  type ClientFactory,
+  type DevicePermission,
+  type LaunchPermissions,
+  type MobileOptions,
+  type PermissionState,
+  type TransitionBudgets,
+} from './options.ts';
 import { maskPng } from './png.ts';
 import { mobileDoctor } from './doctor.ts';
 import { deviceLabel, pinnedApp, type SlotBinding } from './bindings.ts';
@@ -221,9 +230,18 @@ interface NodeBinding {
  * a tap aimed from either frame lands on whatever is behind the control.
  * Once the budget has passed the control is found again in a fresh
  * snapshot. Unmoved controls are immediate only when keyboard state also
- * stayed the same; a visible keyboard can precede the app's relayout.
+ * stayed the same; a visible keyboard can precede the app's relayout. This is
+ * the budget after every action when the `transition` option sets none; the
+ * option can give a gesture or a launch a budget of its own, see
+ * {@link TransitionBudgets}.
  */
 const DEFAULT_TRANSITION_MS = 500;
+
+/** The kind of an action, which picks the transition budget after it: `gesture` for a scroll or swipe, `launch` for the app starting or closing, `default` for the rest. */
+type ActionKind = keyof TransitionBudgets;
+
+/** The transition budget after each kind of action, in milliseconds. */
+type TransitionWaits = Readonly<Record<ActionKind, number>>;
 
 /** How one screenshot is taken. */
 interface ScreenshotCapture {
@@ -377,13 +395,44 @@ function permissionError(code: 'INVALID_CONFIG' | 'INVALID_ARGUMENT', message: s
   throw code === 'INVALID_CONFIG' ? new ConfigurationError(code, message) : new TestError(code, message);
 }
 
-/** Resolves the `transition` option: the default budget or a custom one. */
-function transitionMs(transition: MobileOptions['transition']): number {
-  const budget = transition ?? DEFAULT_TRANSITION_MS;
+/** Every budget `transition` takes by kind of action, kept equal to `TransitionBudgets` by the compiler. */
+const TRANSITION_BUDGET_KEYS: readonly string[] = Object.keys({ default: true, gesture: true, launch: true } satisfies Record<ActionKind, true>);
+
+/** Refuses a budget that is not a non-negative integer of milliseconds; `option` is how the message names it. */
+function budgetMs(budget: number, option: string): number {
   if (!Number.isInteger(budget) || budget < 0) {
-    throw new ConfigurationError('INVALID_CONFIG', 'mobile: `transition` must be a non-negative integer of milliseconds');
+    throw new ConfigurationError('INVALID_CONFIG', `mobile: \`${option}\` must be a non-negative integer of milliseconds`);
   }
   return budget;
+}
+
+/**
+ * Resolves the `transition` option into the budget after each kind of action.
+ * A number, or no option, is one budget for all of them. An object sets a
+ * budget per kind, and `gesture` and `launch` take the `default` one when
+ * left out.
+ */
+function transitionWaits(transition: MobileOptions['transition']): TransitionWaits {
+  const budgets = transition ?? DEFAULT_TRANSITION_MS;
+  if (typeof budgets === 'number') {
+    const budget = budgetMs(budgets, 'transition');
+    return { default: budget, gesture: budget, launch: budget };
+  }
+  // A string, array, or class instance holds no budgets, so it would run on the default instead of failing.
+  const prototype: unknown = Object.getPrototypeOf(budgets);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new ConfigurationError(
+      'INVALID_CONFIG',
+      `mobile: \`transition\` must be a non-negative integer of milliseconds, or an object of them by kind of action (${TRANSITION_BUDGET_KEYS.join(', ')})`,
+    );
+  }
+  rejectUnknownKeys('mobile: `transition`', budgets, TRANSITION_BUDGET_KEYS);
+  const base = budgetMs(budgets.default ?? DEFAULT_TRANSITION_MS, 'transition.default');
+  return {
+    default: base,
+    gesture: budgetMs(budgets.gesture ?? base, 'transition.gesture'),
+    launch: budgetMs(budgets.launch ?? base, 'transition.launch'),
+  };
 }
 
 /** Resolves the `settle` option: the default window, a custom one, or no wait at all. */
@@ -453,12 +502,14 @@ export class AgentDeviceSurface {
   readonly settleOptions: SettleOptions;
   /** When this surface last acted on the device (an input or an app launch); the screen may be in transition for a while after. */
   private lastActionAt = 0;
+  /** The kind of that action, which picks the budget the screen gets to come to rest. */
+  private lastActionKind: ActionKind = 'default';
   /** The screen as last projected before that action, to tell controls that were already there from ones that came with it. */
   private screenBeforeAction: ProjectedScreen | undefined;
   /** The most recent projection of the screen, from any observe or locate. */
   private latestScreen: ProjectedScreen | undefined;
-  /** Budget a control that came with the last action gets to finish arriving; see DEFAULT_TRANSITION_MS. */
-  private readonly transitionMs: number;
+  /** Budget a control that came with the last action gets to finish arriving, by the kind of that action; see DEFAULT_TRANSITION_MS. */
+  private readonly transitionWaits: TransitionWaits;
   /**
    * The screen's logical size as last learned from a snapshot with geometry
    * or from the device itself, so a snapshot without geometry (an empty
@@ -476,7 +527,7 @@ export class AgentDeviceSurface {
     rejectUnknownKeys('mobile()', options, MOBILE_OPTION_KEYS);
     this.pool = new DevicePool(options, createClient);
     this.settleOptions = settleOptions(options.settle);
-    this.transitionMs = transitionMs(options.transition);
+    this.transitionWaits = transitionWaits(options.transition);
   }
 
   /** Whether the target pins an app for `app.open()`, `app.restart()`, and `app.clearState()` to launch. */
@@ -915,7 +966,7 @@ export class AgentDeviceSurface {
    * bindings names a node that still exists.
    */
   private screenReplaced(): void {
-    this.markAction(undefined);
+    this.markAction(undefined, 'launch');
     this.generation = new Map();
     this.located.clear();
   }
@@ -1266,10 +1317,13 @@ export class AgentDeviceSurface {
     return best;
   }
 
-  /** Waits for the transition without exceeding the action's remaining budget. */
+  /**
+   * Waits out what is left of the last action's budget, by the kind of that
+   * action, without exceeding the action's own remaining budget.
+   */
   private async waitOutTransition(operation: OperationContext, budget: InputBudget): Promise<void> {
     await raceAbort(async () => {
-      const remaining = this.transitionMs - (Date.now() - this.lastActionAt);
+      const remaining = this.transitionWaits[this.lastActionKind] - (Date.now() - this.lastActionAt);
       if (remaining <= 0) return;
       const available = budget.remainingMs();
       if (available > 0) await sleep(Math.min(remaining, available), operation.signal);
@@ -1282,14 +1336,14 @@ export class AgentDeviceSurface {
   }
 
   /**
-   * Waits for a control that arrived or moved with the last action, returning
-   * whether it needs a fresh capture. Controls already present at the same
-   * place need no wait, unless keyboard state changed: a keyboard change can
-   * precede the app's relayout.
+   * Waits for a control that arrived or moved with the last action until the
+   * budget of that action's kind has passed, returning whether it needs a fresh
+   * capture. Controls already present at the same place need no wait, unless
+   * keyboard state changed: a keyboard change can precede the app's relayout.
    */
   private async waitForTransition(entry: NodeBinding, operation: OperationContext, budget: InputBudget): Promise<boolean> {
     const since = Date.now() - this.lastActionAt;
-    const remaining = this.transitionMs - since;
+    const remaining = this.transitionWaits[this.lastActionKind] - since;
     if (remaining <= 0) return false;
     const before = this.screenBeforeAction;
     if (before !== undefined && before.keyboardVisible === entry.keyboardVisible && this.samePlace(entry, before.index) !== undefined) return false;
@@ -1327,11 +1381,13 @@ export class AgentDeviceSurface {
 
   /**
    * Records an action the device received: the screen as it was projected
-   * before it, and when it returned. The transition budget counts from the
-   * return, since the input lands late in the command's own round trip.
+   * before it, what kind of action it was, and when it returned. The
+   * transition budget of that kind counts from the return, since the input
+   * lands late in the command's own round trip.
    */
-  private markAction(before: ProjectedScreen | undefined): void {
+  private markAction(before: ProjectedScreen | undefined, kind: ActionKind = 'default'): void {
     this.screenBeforeAction = before;
+    this.lastActionKind = kind;
     this.lastActionAt = Date.now();
   }
 
@@ -1355,7 +1411,7 @@ export class AgentDeviceSurface {
       if (deterministic) await this.waitOutTransition(operation, input);
       const before = this.latestScreen;
       await this.command('swipe', (client) => input.send(() => client.interactions.scroll({ direction: action.direction, ...settle })), operation.signal);
-      this.markAction(before);
+      this.markAction(before, 'gesture');
       return;
     }
     const entry = this.resolveRef(ref);
@@ -1449,7 +1505,7 @@ export class AgentDeviceSurface {
     } catch (cause) {
       throw staleOr(cause, label, this.where);
     }
-    this.markAction(before);
+    this.markAction(before, action.kind === 'swipe' ? 'gesture' : 'default');
   }
 
   /**
@@ -1492,7 +1548,7 @@ export class AgentDeviceSurface {
     const before = this.latestScreen;
     const holdMs = action.kind === 'longPress' ? (action.durationMs ?? DEFAULT_LONG_PRESS_MS) : action.kind === 'swipeTo' ? action.durationMs : undefined;
     await this.command(`${action.kind} at point`, (client) => input.send(() => pointerInteraction(client, point, action, settle), holdMs), operation.signal);
-    this.markAction(before);
+    this.markAction(before, action.kind === 'swipeTo' ? 'gesture' : 'default');
   }
 
   /**
