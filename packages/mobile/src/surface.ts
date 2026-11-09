@@ -233,15 +233,49 @@ interface NodeBinding {
  * stayed the same; a visible keyboard can precede the app's relayout. This is
  * the budget after every action when the `transition` option sets none; the
  * option can give a gesture or a launch a budget of its own, see
- * {@link TransitionBudgets}.
+ * {@link TransitionBudgets}. A scroll or swipe is a different case from a
+ * control that slides in. It can return while its content still moves, and the
+ * tree shows that content in flight. After a gesture the budget is only the
+ * least wait, and the wait goes on until the control is seen at rest, see
+ * GESTURE_REST_CAP_MS.
  */
 const DEFAULT_TRANSITION_MS = 500;
+
+/**
+ * The longest a control that came with a gesture is waited for to stop
+ * moving, counted from when the gesture returned. A `gesture` budget above it
+ * is the cap instead. A scroll can return while its fling goes on, and the
+ * tree shows the content in flight. On an iOS simulator with agent-device
+ * 0.21.36, 3 of 120 scrolls of a long list left it moving 1.66 to 1.84 s after
+ * `scroll` returned, and the reads taken meanwhile saw 2 to 3 different
+ * positions. Past the cap the action goes ahead where the control was last
+ * read, as it would after a blind sleep. A screen that never stops moving
+ * costs the cap and no more.
+ */
+const GESTURE_REST_CAP_MS = 4_000;
+
+/**
+ * The pause between two reads of a control that has not come to rest. A read
+ * takes time of its own on a device. The pause keeps a daemon that answers at
+ * once from being read in a tight loop until the cap.
+ */
+const REST_READ_GAP_MS = 50;
 
 /** The kind of an action, which picks the transition budget after it: `gesture` for a scroll or swipe, `launch` for the app starting or closing, `default` for the rest. */
 type ActionKind = keyof TransitionBudgets;
 
 /** The transition budget after each kind of action, in milliseconds. */
 type TransitionWaits = Readonly<Record<ActionKind, number>>;
+
+/**
+ * What a transition wait leaves its caller: `false` when it waited for
+ * nothing, `true` after a sleep that the control must be read again from, or
+ * the control itself, as the read that found it at rest saw it.
+ */
+type TransitionWait = boolean | NodeBinding;
+
+/** Where a control and every node that looks like it sat in one capture, top to bottom, then left to right. */
+type Sighting = readonly Rect[];
 
 /** How one screenshot is taken. */
 interface ScreenshotCapture {
@@ -264,6 +298,37 @@ function centreOf(rect: Rect): { x: number; y: number } {
 function sameRect(a: Rect | undefined, b: Rect | undefined): boolean {
   if (a === undefined || b === undefined) return false;
   return Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1 && Math.abs(a.width - b.width) < 1 && Math.abs(a.height - b.height) < 1;
+}
+
+/** The nodes of a capture that look like a binding: the same role, test id, name, and text. The binding's own node is one of them. */
+function lookalikes(entry: NodeBinding, index: readonly ProjectedNode[]): ProjectedNode[] {
+  return index.filter(
+    (candidate) =>
+      candidate.node.role === entry.node.role &&
+      candidate.node.testId === entry.node.testId &&
+      candidate.node.name === entry.node.name &&
+      candidate.node.text === entry.node.text,
+  );
+}
+
+/**
+ * Where a binding's control and its look-alikes sit in one capture; undefined
+ * when one has no bounds, since nothing can be said to hold still then. The
+ * look-alikes count so that a row of a repeated list, moved by exactly one row
+ * between two reads, does not pass for one that stood still.
+ */
+function sighting(entry: NodeBinding, index: readonly ProjectedNode[]): Sighting | undefined {
+  const rects: Rect[] = [];
+  for (const candidate of lookalikes(entry, index)) {
+    if (candidate.node.rect === undefined) return undefined;
+    rects.push(candidate.node.rect);
+  }
+  return rects.toSorted((a, b) => a.y - b.y || a.x - b.x);
+}
+
+/** Whether two sightings are one: as many nodes, each in the same place as its counterpart in position order. */
+function sameSighting(a: Sighting | undefined, b: Sighting | undefined): boolean {
+  return a !== undefined && b !== undefined && a.length === b.length && a.every((rect, position) => sameRect(rect, b[position]));
 }
 
 const MAX_LOCATED_REFS = 2048;
@@ -1294,13 +1359,7 @@ export class AgentDeviceSurface {
    * id, same name and text, and of those the one closest to where it was.
    */
   private refind(entry: NodeBinding, index: readonly ProjectedNode[]): ProjectedNode | undefined {
-    const candidates = index.filter(
-      (candidate) =>
-        candidate.node.role === entry.node.role &&
-        candidate.node.testId === entry.node.testId &&
-        candidate.node.name === entry.node.name &&
-        candidate.node.text === entry.node.text,
-    );
+    const candidates = lookalikes(entry, index);
     if (candidates.length <= 1 || entry.node.rect === undefined) return candidates[0];
     const was = centreOf(entry.node.rect);
     let best = candidates[0];
@@ -1337,24 +1396,84 @@ export class AgentDeviceSurface {
 
   /**
    * Waits for a control that arrived or moved with the last action until the
-   * budget of that action's kind has passed, returning whether it needs a fresh
-   * capture. Controls already present at the same place need no wait, unless
-   * keyboard state changed: a keyboard change can precede the app's relayout.
+   * budget of that action's kind has passed. Controls already present at the
+   * same place need no wait, unless keyboard state changed: a keyboard change
+   * can precede the app's relayout.
+   *
+   * After a gesture the budget is only the least wait. The control is then
+   * read until it is seen at rest, see {@link atRest}. After any other action
+   * the wait is a sleep, and a read after it finds the control again. No read
+   * can end that sleep early, since the tree cannot tell a control that is
+   * still sliding in from one that landed, see DEFAULT_TRANSITION_MS. A budget
+   * of 0 is no wait at all, after a gesture too: no sleep and no read.
    */
-  private async waitForTransition(entry: NodeBinding, operation: OperationContext, budget: InputBudget): Promise<boolean> {
+  private async waitForTransition(entry: NodeBinding, operation: OperationContext, budget: InputBudget): Promise<TransitionWait> {
     const since = Date.now() - this.lastActionAt;
-    const remaining = this.transitionWaits[this.lastActionKind] - since;
-    if (remaining <= 0) return false;
+    const kind = this.lastActionKind;
+    const floor = this.transitionWaits[kind];
+    const until = kind === 'gesture' && floor > 0 ? Math.max(floor, GESTURE_REST_CAP_MS) : floor;
+    if (since >= until) return false;
     const before = this.screenBeforeAction;
     if (before !== undefined && before.keyboardVisible === entry.keyboardVisible && this.samePlace(entry, before.index) !== undefined) return false;
-    await this.waitOutTransition(operation, budget);
-    return true;
+    if (since < floor) await this.waitOutTransition(operation, budget);
+    if (kind !== 'gesture') return true;
+    return this.atRest(entry, operation, budget, this.lastActionAt + until);
   }
 
-  /** Refreshes a control after a transition wait, keeping the binding when no wait was needed. */
+  /**
+   * Reads the screen until the control is seen at rest, and returns it as that
+   * read saw it, so the caller needs no read of its own. Two sightings that
+   * agree are a rest. A sighting is the control and its look-alikes, and two
+   * agree when they are as many and sit at the same places. The pair is the
+   * read `entry` came from and the first read here, or two reads here in a
+   * row. The control is tracked through the reads as `refind` does. A read
+   * that no longer lists it is a retryable NODE_STALE, as in `relocated`, and
+   * not a wait for the cap. At `capAt` the latest read stands, agreeing or not.
+   * So does it when the action's own budget cannot fit another read and the
+   * pause before it, as `snapshot` returns a sparse capture rather than time
+   * out on a retry it cannot fit.
+   */
+  private async atRest(entry: NodeBinding, operation: OperationContext, budget: InputBudget, capAt: number): Promise<NodeBinding> {
+    let tracked = entry;
+    let previous = this.sightingAt(entry);
+    for (;;) {
+      const startedAt = Date.now();
+      const raw = await this.snapshotOrEmpty(operation, false, budget);
+      const readMs = Date.now() - startedAt;
+      const projected = this.project(raw);
+      const found = this.refind(tracked, projected.index);
+      if (found === undefined) {
+        throw new EngineError('NODE_STALE', `node ${entry.id} changed during transition; re-resolve`, { retryable: true });
+      }
+      tracked = this.bind(found, projected);
+      const seen = sighting(tracked, projected.index);
+      const left = capAt - Date.now();
+      if (sameSighting(previous, seen) || left <= 0 || budget.remainingMs() <= REST_READ_GAP_MS + readMs) return tracked;
+      previous = seen;
+      await sleep(Math.min(REST_READ_GAP_MS, left), operation.signal);
+      if (operation.signal.aborted) {
+        throw new EngineError('CANCELLED', 'transition wait cancelled', { retryable: false });
+      }
+    }
+  }
+
+  /**
+   * Where the control and its look-alikes sat in the read an action resolved
+   * on. That read is the newest projection when `entry` is one of its nodes.
+   * After a newer read only the control's own place is left of it, which a read
+   * with a look-alike never matches.
+   */
+  private sightingAt(entry: NodeBinding): Sighting | undefined {
+    const latest = this.latestScreen;
+    if (latest?.index.some((node) => node.id === entry.id) === true) return sighting(entry, latest.index);
+    return entry.node.rect === undefined ? undefined : [entry.node.rect];
+  }
+
+  /** Refreshes a control after a transition wait. That is the control as the wait read it at rest, else found again after a sleep, else the binding itself when no wait was needed. */
   private async settled(entry: NodeBinding, operation: OperationContext, budget: InputBudget): Promise<NodeBinding> {
-    if (await this.waitForTransition(entry, operation, budget)) return this.relocated(entry, operation, budget);
-    return entry;
+    const waited = await this.waitForTransition(entry, operation, budget);
+    if (waited === true) return this.relocated(entry, operation, budget);
+    return waited === false ? entry : waited;
   }
 
   /**
