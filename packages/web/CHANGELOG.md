@@ -1,5 +1,15 @@
 # @e2e-dev/web
 
+## 0.15.6
+
+### Patch Changes
+
+- [#1609](https://github.com/tester-army/e2e/pull/1609) [`34a260c`](https://github.com/tester-army/e2e/commit/34a260cc59d7ebd1d414fd2716f955bd2a51795f) Thanks [@okwasniewski](https://github.com/okwasniewski)! - Bump playwright-core to 1.65.0 and commander to 15.1.0. `fill` no longer rejects malformed date, time, color, and range values, and actions wait for an element to leave an `inert` subtree. Smol sandboxes use the Playwright 1.65.0 image.
+
+- [#1614](https://github.com/tester-army/e2e/pull/1614) [`f6aba97`](https://github.com/tester-army/e2e/commit/f6aba97257700339b60fb67722178d23ee2c5f93) Thanks [@okwasniewski](https://github.com/okwasniewski)! - A screenshot taken while the page navigates still captures the document showing when Playwright reports the destroyed context before the navigation event.
+
+- [#1592](https://github.com/tester-army/e2e/pull/1592) [`b43e846`](https://github.com/tester-army/e2e/commit/b43e8469ce55c96e54d979d08ccf0034ad93e546) Thanks [@KrzysztofMoch](https://github.com/KrzysztofMoch)! - `expect(browser).toHaveURL` failures print a relative expected URL resolved against the app URL, the same way it is compared, so it reads beside the absolute observed URL.
+
 ## 0.15.5
 
 ### Patch Changes
